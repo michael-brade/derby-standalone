@@ -967,7 +967,7 @@ function componentHooksFromAttributes(attributes) {
     // Parse `as` assignments
     if (key === 'as') {
       var segments = parseAsAttribute(key, value);
-      hooks.push(new templates.AsProperty(segments));
+      hooks.push(new templates.AsPropertyComponent(segments));
       delete attributes[key];
       continue;
     }
@@ -1425,9 +1425,6 @@ exports.Context = Context;
 
 function noop() {}
 
-// TODO:
-// Implement removeItemContext
-
 function ContextMeta() {
   this.addBinding = noop;
   this.removeBinding = noop;
@@ -1482,6 +1479,7 @@ function Context(meta, controller, parent, unbound, expression) {
 
   // Used in EventModel
   this._id = null;
+  this._eventModels = null;
 }
 
 Context.prototype.id = function() {
@@ -1503,7 +1501,24 @@ Context.prototype.removeBinding = function(binding) {
   this.meta.removeBinding(binding);
 };
 Context.prototype.removeNode = function(node) {
-  this.meta.removeNode(node);
+  var bindItemStart = node.$bindItemStart;
+  if (bindItemStart) {
+    this.meta.removeItemContext(bindItemStart.context);
+  }
+  var component = node.$component;
+  if (component) {
+    node.$component = null;
+    if (!component.singleton) {
+      component.destroy();
+    }
+  }
+  var destroyListeners = node.$destroyListeners;
+  if (destroyListeners) {
+    node.$destroyListeners = null;
+    for (var i = 0, len = destroyListeners.length; i < len; i++) {
+      destroyListeners[i]();
+    }
+  }
 };
 
 Context.prototype.child = function(expression) {
@@ -2151,20 +2166,23 @@ FnExpression.prototype.apply = function(context, extraInputs) {
   return out;
 };
 FnExpression.prototype._lookupParent = function(context) {
-  // Lookup function on current controller
-  var controller = context.controller;
+  // Lookup function in the model
   var segments = this.parentSegments;
-  var parent = (segments) ? lookup(segments, controller) : controller;
-  if (parent && parent[this.lastSegment]) return parent;
+  var parent = (segments) ? lookup(segments, context.controller.model.data) : undefined;
+  if (parent && typeof parent[this.lastSegment] == 'function') return parent;
+  // Otherwise lookup function on current controller
+  var controller = context.controller;
+  parent = (segments) ? lookup(segments, controller) : controller;
+  if (parent && typeof parent[this.lastSegment] == 'function') return parent;
   // Otherwise lookup function on page
   var page = controller.page;
   if (controller !== page) {
     parent = (segments) ? lookup(segments, page) : page;
-    if (parent && parent[this.lastSegment]) return parent;
+    if (parent && typeof parent[this.lastSegment] == 'function') return parent;
   }
   // Otherwise lookup function on global
   parent = (segments) ? lookup(segments, global) : global;
-  if (parent && parent[this.lastSegment]) return parent;
+  if (parent && typeof parent[this.lastSegment] == 'function') return parent;
   // Throw if not found
   throw new Error('Function not found for: ' + this.segments.join('.'));
 };
@@ -2576,12 +2594,16 @@ exports.MarkupHook = MarkupHook;
 exports.ElementOn = ElementOn;
 exports.ComponentOn = ComponentOn;
 exports.AsProperty = AsProperty;
+exports.AsPropertyComponent = AsPropertyComponent;
 exports.AsObject = AsObject;
 exports.AsObjectComponent = AsObjectComponent;
 exports.AsArray = AsArray;
 exports.AsArrayComponent = AsArrayComponent;
 
 exports.emptyTemplate = new saddle.Template([]);
+
+exports.elementAddDestroyListener = elementAddDestroyListener;
+exports.elementRemoveDestroyListener = elementRemoveDestroyListener;
 
 // Add ::isUnbound to Template && Binding
 saddle.Template.prototype.isUnbound = function(context) {
@@ -2834,7 +2856,7 @@ View.prototype.dependencies = function(context, options) {
 };
 View.prototype.parse = function() {
   this._parse();
-  if (this.componentFactory) {
+  if (this.componentFactory && !this.componentFactory.constructor.prototype.singleton) {
     var marker = new Marker(this.name);
     this.template.content.unshift(marker);
   }
@@ -3103,21 +3125,15 @@ ElementOn.prototype.serialize = function() {
   return serializeObject.instance(this, this.name, this.expression);
 };
 ElementOn.prototype.emit = function(context, element) {
-  var elementOn = this;
   if (this.name === 'create') {
     this.apply(context, element);
-
-  } else if (this.name === 'destroy') {
-    var destroyListeners = element.$destroyListeners || (element.$destroyListeners = []);
-    destroyListeners.push(function elementOnDestroy() {
-      elementOn.apply(context, element);
-    });
-
-  } else {
-    element.addEventListener(this.name, function elementOnListener(event) {
-      return elementOn.apply(context, element, event);
-    }, false);
+    return;
   }
+  var elementOn = this;
+  var listener = function elementOnListener(event) {
+    return elementOn.apply(context, element, event);
+  };
+  context.controller.dom.on(this.name, element, listener, false);
 };
 ElementOn.prototype.apply = function(context, element, event) {
   var modelData = context.controller.model.data;
@@ -3161,7 +3177,22 @@ AsProperty.prototype.serialize = function() {
 AsProperty.prototype.emit = function(context, target) {
   var node = traverseAndCreate(context.controller, this.segments);
   node[this.lastSegment] = target;
+  this.addListeners(target, node, this.lastSegment);
 };
+AsProperty.prototype.addListeners = function(target, object, key) {
+  this.addDestroyListener(target, function asPropertyDestroy() {
+    delete object[key];
+  });
+};
+AsProperty.prototype.addDestroyListener = elementAddDestroyListener;
+
+function AsPropertyComponent(segments) {
+  AsProperty.call(this, segments);
+}
+AsPropertyComponent.prototype = Object.create(AsProperty.prototype);
+AsPropertyComponent.prototype.constructor = AsPropertyComponent;
+AsPropertyComponent.prototype.type = 'AsPropertyComponent';
+AsPropertyComponent.prototype.addDestroyListener = componentAddDestroyListener;
 
 function AsObject(segments, keyExpression) {
   AsProperty.call(this, segments);
@@ -3181,15 +3212,6 @@ AsObject.prototype.emit = function(context, target) {
   object[key] = target;
   this.addListeners(target, object, key);
 };
-AsObject.prototype.addListeners = function(target, object, key) {
-  this.addDestroyListener(target, function asObjectDestroy() {
-    delete object[key];
-  });
-};
-AsObject.prototype.addDestroyListener = function(target, listener) {
-  var listeners = target.$destroyListeners || (target.$destroyListeners = []);
-  listeners.push(listener);
-};
 
 function AsObjectComponent(segments, keyExpression) {
   AsObject.call(this, segments, keyExpression);
@@ -3197,9 +3219,7 @@ function AsObjectComponent(segments, keyExpression) {
 AsObjectComponent.prototype = Object.create(AsObject.prototype);
 AsObjectComponent.prototype.constructor = AsObjectComponent;
 AsObjectComponent.prototype.type = 'AsObjectComponent';
-AsObjectComponent.prototype.addDestroyListener = function(target, listener) {
-  target.on('destroy', listener);
-};
+AsObjectComponent.prototype.addDestroyListener = componentAddDestroyListener;
 
 function AsArray(segments) {
   AsProperty.call(this, segments);
@@ -3232,14 +3252,12 @@ AsArray.prototype.emit = function(context, target) {
 };
 AsArray.prototype.addListeners = function(target, array) {
   this.addDestroyListener(target, function asArrayDestroy() {
-    var index = array.indexOf(target);
-    if (index !== -1) array.splice(index, 1);
+    removeArrayItem(array, target);
   });
 };
 AsArray.prototype.comparePosition = function(target, item) {
   return item.compareDocumentPosition(target);
 };
-AsArray.prototype.addDestroyListener = AsObject.prototype.addDestroyListener;
 
 function AsArrayComponent(segments) {
   AsArray.call(this, segments);
@@ -3250,7 +3268,33 @@ AsArrayComponent.prototype.type = 'AsArrayComponent';
 AsArrayComponent.prototype.comparePosition = function(target, item) {
   return item.markerNode.compareDocumentPosition(target.markerNode);
 };
-AsArrayComponent.prototype.addDestroyListener = AsObjectComponent.prototype.addDestroyListener;
+AsArrayComponent.prototype.addDestroyListener = componentAddDestroyListener;
+
+function elementAddDestroyListener(element, listener) {
+  var destroyListeners = element.$destroyListeners;
+  if (destroyListeners) {
+    if (destroyListeners.indexOf(listener) === -1) {
+      destroyListeners.push(listener);
+    }
+  } else {
+    element.$destroyListeners = [listener];
+  }
+}
+function elementRemoveDestroyListener(element, listener) {
+  var destroyListeners = element.$destroyListeners;
+  if (destroyListeners) {
+    removeArrayItem(destroyListeners, listener);
+  }
+}
+function componentAddDestroyListener(target, listener) {
+  target.on('destroy', listener);
+}
+function removeArrayItem(array, item) {
+  var index = array.indexOf(item);
+  if (index > -1) {
+    array.splice(index, 1);
+  }
+}
 
 },{"./options":10,"./util":12,"saddle":56,"serialize-object":57}],12:[function(require,module,exports){
 
@@ -3476,13 +3520,14 @@ App.prototype.component = function(name, constructor, isDependency) {
   }
 
   var viewProp = constructor.view;
-  var viewIs, viewFilename, viewSource, viewDependencies;
+  var viewIs, viewFilename, viewSource, viewDependencies, viewStyle;
   // Always using an object for the static `view` property is preferred
   if (viewProp && typeof viewProp === 'object') {
     viewIs = viewProp.is;
     viewFilename = viewProp.file;
     viewSource = viewProp.source;
     viewDependencies = viewProp.dependencies;
+    viewStyle = viewProp.style;
   } else {
     // Ignore other properties when `view` is an object. It is possible that
     // properties could be inherited from a parent component when extending it.
@@ -3554,6 +3599,10 @@ App.prototype.component = function(name, constructor, isDependency) {
   if (!view) {
     var message = this.views.findErrorMessage(viewName);
     throw new Error(message);
+  }
+
+  if (viewStyle) {
+    this.loadStyles(viewStyle);
   }
 
   // Inherit from Component
