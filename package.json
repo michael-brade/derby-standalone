@@ -20,7 +20,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "derby": "^0.10.21"
+    "derby": "michael-brade/derby"
   },
   "devDependencies": {
     "browser-pack-flat": "^3.4.2",
